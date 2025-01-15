@@ -2,6 +2,7 @@
 local _G = getfenv(0)
 local InFlight, self = InFlight, InFlight
 local NumTaxiNodes, TaxiNodeGetType, TaxiNodeName, UnitOnTaxi, GetTime = NumTaxiNodes, TaxiNodeGetType, TaxiNodeName, UnitOnTaxi, GetTime
+local GetUnitSpeed = GetUnitSpeed
 local format, strsub, floor = format, strsub, floor
 local gtt = GameTooltip
 local oldTakeTaxiNode
@@ -373,9 +374,10 @@ function InFlight:StartTimer(slot)  -- lift off
 	elapsed, totalTime, startTime = 0, 0, GetTime()
 	takeoff, inworld = true, true
 	throt = min(0.2, (endTime or 50) * 0.004)  -- increases updates for short flights
-	self:RegisterEvent("PLAYER_CONTROL_GAINED")
 	self:RegisterEvent("PLAYER_ENTERING_WORLD")
 	self:RegisterEvent("PLAYER_LEAVING_WORLD")
+  self:RegisterEvent("PLAYER_CONTROL_GAINED") 
+	self:RegisterEvent("UNIT_AURA")
 	self:Show()
 	
 	if slot then
@@ -393,6 +395,8 @@ function InFlight:StartMiscFlight(s, d)  -- called from InFlight_Load for specia
 end
 
 do  -- timer bar
+  local MINIMUM_FLIGHT_SPEED = 32
+  
 	local bdrop = { edgeSize = 16, insets = {}, }
 	local bdi = bdrop.insets
 	-----------------------------
@@ -485,15 +489,27 @@ do  -- timer bar
 		function self:PLAYER_ENTERING_WORLD()
 			inworld = true
 		end
-		function self:PLAYER_CONTROL_GAINED()
+    function self:flightEnd()
+      ontaxi = nil
+      onupdate(self, 3)
+      self:UnregisterEvent("PLAYER_ENTERING_WORLD")
+      self:UnregisterEvent("PLAYER_LEAVING_WORLD")
+      self:UnregisterEvent("PLAYER_CONTROL_GAINED")
+      self:UnregisterEvent("UNIT_AURA")
+    end
+    function self:PLAYER_CONTROL_GAINED()
+      if not inworld then return end
+      if not self:IsShown() then return end
+      
+      self:flightEnd()
+    end
+		function self:UNIT_AURA(unit)
 			if not inworld then return end
-			if self:IsShown() then
-				ontaxi = nil
-				onupdate(self, 3)
-			end
-			self:UnregisterEvent("PLAYER_ENTERING_WORLD")
-			self:UnregisterEvent("PLAYER_LEAVING_WORLD")
-			self:UnregisterEvent("PLAYER_CONTROL_GAINED")
+      if not self:IsShown() then return end
+      if not unit or unit ~= "player" then return end
+      if GetUnitSpeed("player") > MINIMUM_FLIGHT_SPEED then return end
+
+      self:flightEnd()
 		end
 		self:SetScript("OnUpdate", onupdate)
 		self.CreateBar = nil
