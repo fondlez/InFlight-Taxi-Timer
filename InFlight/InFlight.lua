@@ -2,11 +2,11 @@
 local _G = getfenv(0)
 local InFlight, self = InFlight, InFlight
 local NumTaxiNodes, TaxiNodeGetType, TaxiNodeName, UnitOnTaxi, GetTime = NumTaxiNodes, TaxiNodeGetType, TaxiNodeName, UnitOnTaxi, GetTime
-local GetUnitSpeed = GetUnitSpeed
 local format, strsub, floor = format, strsub, floor
 local gtt = GameTooltip
 local oldTakeTaxiNode
 local GetGuildLevel = _G.GetGuildLevel
+local IsInGuild = _G.IsInGuild
 
 -- LIBRARIES
 local smed = LibStub("LibSharedMedia-3.0")
@@ -14,10 +14,20 @@ local smed = LibStub("LibSharedMedia-3.0")
 -- LOCAL VARIABLES
 local vars, db  -- addon
 local source, destination, endTime  -- location data
-local porttaken, takeoff, inworld  -- flags
+local porttaken, takeoff, ontaxi, inworld  -- flags
 local rat, endText  -- cache variables
 local sb, spark, timeText, locText, bord  -- frame elements
 local totalTime, startTime, elapsed, throt = 0, 0, 0, 0  -- throttle vars
+local landingElapsed = 0
+local pendingCheck = nil
+
+local function HasGuildPerk()
+	if IsInGuild and IsInGuild() and GetGuildLevel then
+		local glvl = GetGuildLevel()
+		return glvl and glvl >= 21
+	end
+	return false
+end
 
 -- LOCALIZATION 
 local gl = GetLocale()
@@ -215,7 +225,7 @@ local function GetEstimatedTime(slot)  -- estimates flight times based on hops
 			end
 			if s and d then break end
 		end
-		if s and d and vars[s] and vars[s][d] then
+		if s and d and vars and vars[s] and vars[s][d] then
 			etime = etime + vars[s][d]
 		else
 			return nil
@@ -227,9 +237,9 @@ local function postTaxiNodeOnButtonEnter(button) -- adds duration info to node t
 	local id = button:GetID()
 	if TaxiNodeGetType(id) ~= "REACHABLE" then return end
 	
-	local ftime = (vars[source] and vars[source][ ShortenName(TaxiNodeName(id)) ]) or GetEstimatedTime(id) or 0
+	local ftime = (vars and vars[source] and vars[source][ ShortenName(TaxiNodeName(id)) ]) or GetEstimatedTime(id) or 0
     if ftime > 0 then
-        if GetGuildLevel and GetGuildLevel() >= 21 then
+        if HasGuildPerk() then
             ftime = ftime / 1.25
         end
         gtt:AddLine(L_duration..FormatTime(ftime), 1, 1, 1)
@@ -249,8 +259,10 @@ function InFlight:LoadBulk()  -- called from InFlight_Load
 	end
 	db = InFlightDB.perchar and InFlightCharDB or InFlightDB
 
-	InFlightVars = InFlightVars or { Alliance = {}, Horde = {}, }  -- flight time data
-	vars = InFlightVars[UnitFactionGroup("player")]
+	InFlightVars = InFlightVars or { Alliance = {}, Horde = {}, Neutral = {}, }  -- flight time data
+	local faction = UnitFactionGroup("player") or "Neutral"
+	InFlightVars[faction] = InFlightVars[faction] or {}
+	vars = InFlightVars[faction]
 
 	if db.dbinit ~= 8 then
 		db.dbinit = 8
@@ -299,14 +311,15 @@ function InFlight:LoadBulk()  -- called from InFlight_Load
 	oldTakeTaxiNode = TakeTaxiNode
 	TakeTaxiNode = function(slot)
 		if TaxiNodeGetType(slot) ~= "REACHABLE" then return end
+		source = source or ShortenName(GetMinimapZoneText() or GetSubZoneText() or GetZoneText())
 		destination = ShortenName(TaxiNodeName(slot))
-		local t = vars[source]
+		local t = vars and vars[source]
 		if t and t[destination] and t[destination] > 0 then  -- saved variables lookup
 			endTime = t[destination]
 		else
 			endTime = GetEstimatedTime(slot)
 		end
-		if endTime and GetGuildLevel and GetGuildLevel() >= 21 then
+		if endTime and HasGuildPerk() then
 			endTime = endTime / 1.25
 		end
 		if db.confirmflight then  -- confirm flight
@@ -348,14 +361,17 @@ function InFlight:InitSource()  -- cache source location and hook tooltips
 			source = ShortenName(TaxiNodeName(i))
 		end
 	end
+	source = source or ShortenName(GetMinimapZoneText() or GetSubZoneText() or GetZoneText())
 end
 
 ----------------------------------
 function InFlight:StartTimer(slot)  -- lift off
 ----------------------------------
-	Dismount()
-	if CanExitVehicle() == 1 then
-		VehicleExit()
+	if slot then
+		Dismount()
+		if CanExitVehicle and CanExitVehicle() == 1 then
+			VehicleExit()
+		end
 	end
 	if not sb then  -- create the timer bar
 		self:CreateBar()
@@ -373,11 +389,13 @@ function InFlight:StartTimer(slot)  -- lift off
 	porttaken = nil
 	elapsed, totalTime, startTime = 0, 0, GetTime()
 	takeoff, inworld = true, true
+	ontaxi = nil
+	landingElapsed = 0
+	pendingCheck = nil
 	throt = min(0.2, (endTime or 50) * 0.004)  -- increases updates for short flights
 	self:RegisterEvent("PLAYER_ENTERING_WORLD")
 	self:RegisterEvent("PLAYER_LEAVING_WORLD")
-  self:RegisterEvent("PLAYER_CONTROL_GAINED") 
-	self:RegisterEvent("UNIT_AURA")
+	self:RegisterEvent("PLAYER_CONTROL_GAINED")
 	self:Show()
 	
 	if slot then
@@ -389,16 +407,89 @@ end
 function InFlight:StartMiscFlight(s, d)  -- called from InFlight_Load for special flights
 ---------------------------------------
 	self:TAXIMAP_OPENED(nil, true)
-	endTime = vars[s] and vars[s][d]
+	endTime = vars and vars[s] and vars[s][d]
 	source, destination = s, d
 	self:StartTimer()
 end
 
+----------------------------------
+function InFlight:StartTaxiFlight()  -- fallback when on flight but timer not active
+----------------------------------
+	if ontaxi or takeoff or (sb and sb:IsShown()) then return end
+	if not UnitOnTaxi("player") then return end
+
+	source = source or self.lastGossipSource or ShortenName(GetMinimapZoneText() or GetZoneText() or "Taxi")
+	destination = destination or "..."
+	local t = vars and vars[source]
+	if t and t[destination] and t[destination] > 0 then
+		endTime = t[destination]
+	else
+		endTime = nil
+	end
+	if endTime and HasGuildPerk() then
+		endTime = endTime / 1.25
+	end
+
+	self:StartTimer()
+end
+
+------------------------------------
+function InFlight:CheckPendingTaxi()  -- checks for taxi state after control lost
+------------------------------------
+	if ontaxi or takeoff or (sb and sb:IsShown()) then return end
+	if UnitOnTaxi("player") then
+		self:StartTaxiFlight()
+		return
+	end
+	if not sb then
+		self:CreateBar()
+	end
+	pendingCheck = GetTime() + 3.0
+	inworld = true
+	self:Show()
+end
+
 do  -- timer bar
-  local MINIMUM_FLIGHT_SPEED = 32
-  
 	local bdrop = { edgeSize = 16, insets = {}, }
 	local bdi = bdrop.insets
+
+	local function EndFlight()
+		if not self:IsShown() and not (sb and sb:IsShown()) then return end
+
+		self:UnregisterEvent("PLAYER_CONTROL_GAINED")
+
+		if ontaxi and not porttaken and source then
+			if destination == "..." then
+				local landZone = ShortenName(GetMinimapZoneText() or GetSubZoneText() or GetZoneText())
+				if landZone and landZone ~= "" and landZone ~= source then
+					destination = landZone
+				end
+			end
+
+			if destination and destination ~= "..." and totalTime >= 3 then
+				local duration = totalTime
+				if HasGuildPerk() then
+					duration = duration * 1.25
+				end
+				if vars then
+					vars[source] = vars[source] or {}
+					vars[source][destination] = floor(duration + 0.5)
+				end
+			end
+		end
+
+		takeoff, ontaxi = nil, nil
+		endTime = nil
+		landingElapsed = 0
+		pendingCheck = nil
+
+		if sb then
+			sb:Hide()
+		end
+		self:Hide()
+	end
+	self.EndFlight = EndFlight
+
 	-----------------------------
 	function InFlight:CreateBar()
 	-----------------------------
@@ -439,78 +530,99 @@ do  -- timer bar
 
 		InFlight:UpdateLook()
 
-		local ontaxi
 		local function onupdate(this, a1)
+			if not inworld then return end
+
 			elapsed = elapsed + a1
 			if elapsed < throt then return end
-			totalTime = GetTime() - startTime
 			elapsed = 0
+
+			if pendingCheck then
+				if UnitOnTaxi("player") then
+					pendingCheck = nil
+					self:StartTaxiFlight()
+					return
+				elseif GetTime() > pendingCheck then
+					pendingCheck = nil
+					if not ontaxi and not takeoff then
+						this:Hide()
+					end
+					return
+				end
+			end
+
+			totalTime = GetTime() - startTime
 
 			if takeoff then  -- check if actually in flight after take off (doesn't happen immediately)
 				if UnitOnTaxi("player") then
 					takeoff, ontaxi = nil, true
+					landingElapsed = 0
 					sb:Show()
-					elapsed, totalTime, startTime = throt - 0.01, 0, GetTime()
-				elseif totalTime > 5 then
-					this:Hide()
+					totalTime = 0
+					startTime = GetTime()
+				elseif totalTime > 10 then  -- allow up to 10s for taxi takeoff on laggy servers
+					EndFlight()
 				end
 				return
 			end
-			if not ontaxi then  -- flight ended
-				if not porttaken then
-					if GetGuildLevel and GetGuildLevel() >= 21 then
-						totalTime = totalTime * 1.25
+
+			if ontaxi then
+				if not UnitOnTaxi("player") then
+					landingElapsed = landingElapsed + throt
+					if landingElapsed >= 0.4 then  -- player has landed
+						EndFlight()
+						return
 					end
-					vars[source] = vars[source] or { }
-					vars[source][destination] = floor(totalTime + 0.5)
-				end
-				endTime = nil
-				sb:Hide()
-				this:Hide()
-				return
-			end
-			if endTime then  -- update statusbar if destination time is known
-				if totalTime - 2 > endTime then   -- in case the flight is longer than expected
-					SetToUnknown()
-					endTime = nil
 				else
-					local value = (db.fill and totalTime) or (endTime - totalTime)
-					sb:SetValue(value / endTime)
-					spark:SetPoint("CENTER", sb, "LEFT", value * rat, 0)
-					FormatTime(value, timeText)
+					landingElapsed = 0
 				end
-			else  -- destination time is unknown, so show that it's timing
-				FormatTime(totalTime, timeText)
+
+				if endTime then  -- update statusbar if destination time is known
+					if totalTime - 2 > endTime then   -- in case the flight is longer than expected
+						SetToUnknown()
+						endTime = nil
+					else
+						local value = (db.fill and totalTime) or (endTime - totalTime)
+						sb:SetValue(value / endTime)
+						spark:SetPoint("CENTER", sb, "LEFT", value * rat, 0)
+						FormatTime(value, timeText)
+					end
+				else  -- destination time is unknown, so show that it's timing
+					FormatTime(totalTime, timeText)
+				end
 			end
 		end
+
 		function self:PLAYER_LEAVING_WORLD()
 			inworld = nil
 		end
 		function self:PLAYER_ENTERING_WORLD()
 			inworld = true
+			if not UnitOnTaxi("player") and ontaxi then
+				EndFlight()
+			elseif UnitOnTaxi("player") and not ontaxi and not takeoff then
+				self:StartTaxiFlight()
+			end
 		end
-    function self:flightEnd()
-      ontaxi = nil
-      onupdate(self, 3)
-      self:UnregisterEvent("PLAYER_ENTERING_WORLD")
-      self:UnregisterEvent("PLAYER_LEAVING_WORLD")
-      self:UnregisterEvent("PLAYER_CONTROL_GAINED")
-      self:UnregisterEvent("UNIT_AURA")
-    end
-    function self:PLAYER_CONTROL_GAINED()
-      if not inworld then return end
-      if not self:IsShown() then return end
-      
-      self:flightEnd()
-    end
-		function self:UNIT_AURA(unit)
+		function self:PLAYER_CONTROL_GAINED()
 			if not inworld then return end
-      if not self:IsShown() then return end
-      if not unit or unit ~= "player" then return end
-      if GetUnitSpeed("player") > MINIMUM_FLIGHT_SPEED then return end
+			if not self:IsShown() then return end
+			if takeoff then return end  -- ignore control events while still preparing for takeoff
 
-      self:flightEnd()
+			if ontaxi and not UnitOnTaxi("player") then
+				EndFlight()
+			end
 		end
+		function self:PLAYER_CONTROL_LOST()
+			if not inworld then return end
+			if ontaxi or takeoff or (sb and sb:IsShown()) then return end
+			if UnitOnTaxi("player") then
+				self:StartTaxiFlight()
+			else
+				self:CheckPendingTaxi()
+			end
+		end
+
 		self:SetScript("OnUpdate", onupdate)
 		self.CreateBar = nil
 	end
