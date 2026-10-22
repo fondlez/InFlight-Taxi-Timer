@@ -18,6 +18,8 @@ function InFlight:ADDON_LOADED(a1)
 ----------------------------------
 	if a1 == "InFlight_Load" then
 		self:RegisterEvent("TAXIMAP_OPENED")
+		self:RegisterEvent("PLAYER_CONTROL_LOST")
+		self:RegisterEvent("PLAYER_ENTERING_WORLD")
 		if self.SetupInFlight then
 			self:SetupInFlight()
 		else
@@ -33,6 +35,28 @@ function InFlight:TAXIMAP_OPENED(_, misc)
 -----------------------------------------
 	if LoadInFlight() and not misc then
 		self:InitSource()
+	end
+end
+-----------------------------------------
+function InFlight:PLAYER_CONTROL_LOST()
+-----------------------------------------
+	if LoadInFlight() then
+		if UnitOnTaxi("player") then
+			if self.StartTaxiFlight then
+				self:StartTaxiFlight()
+			end
+		elseif self.CheckPendingTaxi then
+			self:CheckPendingTaxi()
+		end
+	end
+end
+-----------------------------------------
+function InFlight:PLAYER_ENTERING_WORLD()
+-----------------------------------------
+	if UnitOnTaxi("player") and LoadInFlight() then
+		if self.StartTaxiFlight then
+			self:StartTaxiFlight()
+		end
 	end
 end
 
@@ -229,6 +253,7 @@ if select(4, GetAddOnInfo("InFlight")) then  -- maybe this stuff gets garbage co
 		if this.type ~= "Gossip" then return end
 		
 		local subzone = GetMinimapZoneText()
+		self.lastGossipSource = subzone or GetZoneText()
 		local tsz = t[subzone]
 		if not tsz then return end
 		
